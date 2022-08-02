@@ -1,0 +1,228 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+use strict;
+my $version="1.0.2";
+
+use Getopt::Long;
+use Cpanel::SafeRun::Timed  ();
+use Term::ANSIColor qw(:constants);
+use List::MoreUtils qw(uniq);
+$Term::ANSIColor::AUTORESET = 1;
+
+print "secheaders - Version: $version\n\n";
+
+my $help;
+
+GetOptions(
+    'help'    => \$help,
+);
+
+if ( $help ) {
+    print CYAN "Usage: secheaders domainname.tld\n";
+    print WHITE <<EOF;
+
+Security headers can address a number of cyber threats. Also known as security-related HTTP response headers,
+they modify the behavior of web browsers to avoid security vulnerabilities.
+
+When a user visits a site through his/her browser, the server responds with HTTP Response Headers.
+These headers tell the browser how to behave during communication with the site.
+
+You can use these headers to outline communication and improve web security.
+Inserting a security header can prevent a variety of hacking attempts.
+
+You can refer to the OWASP Secure Headers Project at https://owasp.org/www-project-secure-headers/
+for the top HTTP response headers that provide security and usability.
+
+EOF
+    exit;
+}
+
+my $domain = @ARGV[0];
+chomp($domain);
+
+# Check if cPanel is installed by checking for status code 200 on port 2083.
+my $chk_2083 = Cpanel::SafeRun::Timed::timedsaferun( 2, 'curl', '-w', '%{http_code}', '-o', '/dev/null', '-s', "https://${domain}:2083" );
+my $has_cpanel = ( $chk_2083 == 200 ) ? 1:0;
+
+# Retrieve headers
+print GREEN "Retrieving headers for https://$domain/ ...\n";
+
+my @required_headers = qw( Strict-Transport-Security X-Frame-Options X-Content-Type-Options Referrer-Policy Permissions-Policy Content-Security-Policy );
+my @additional_headers = qw( Access-Control-Allow-Origin Access-Control-Allow-Methods x-xss-protection );
+my @experimental_headers = qw( Expect-CT Cross-Origin-Embedder-Policy Cross-Origin-Opener-Policy Cross-Origin-Resource-Policy );
+my $headers = Cpanel::SafeRun::Timed::timedsaferun( 6, 'curl', '-s', '-A', "Firefox", '-L', '--head', "https://${domain}/" );
+my @headers = split ( /\n/, $headers );
+my @unique = uniq @headers;
+@headers = @unique;
+
+my $httphead = "";
+my $server = "";
+my $date = "";
+
+foreach my $line( @headers ) {
+    $date = $line if( $line =~ m/Date:/i );
+    $httphead = $line if( $line =~ m/HTTP/ );
+    $server = $line if( $line =~ m/Server:/i );
+}
+
+if( ! $server and ! $date and ! $httphead ) {
+    print "Failed to retrieve header data for $domain\n";
+    exit;
+}
+
+print "HTTP Status: $httphead\n" unless( $httphead eq "" );
+print "$server\n" unless( $server eq "" );
+print "$date\n" unless( $date eq "" );
+
+print "\nRecommended Headers\n";
+print "========================================================================\n";
+foreach my $req (@required_headers) {
+    chomp($req);
+    print "-=-" x 30;
+    print "\n";
+    if ( grep { /$req/i } @headers ) {
+        print "$req - " . GREEN "[GOOD]\n";
+        foreach my $head( @headers ) {
+            next unless( $head =~ m/$req/i );
+            print CYAN "\t\\_ $head\n";
+        }
+    }
+    else {
+        print "$req - " . RED "[MISSING]\n";
+        check_hsts($req) if ( $req =~ m/Strict-Transport-Security/i );
+        check_x_frame_options($req) if ( $req =~ m/X-Frame-Options/i );
+        check_x_content_type_options($req) if ( $req =~ m/X-Content-Type-Options/i );
+        check_csp( $req ) if ( $req =~ m/Content-Security-Policy/i );
+        check_perms( $req ) if ( $req =~ m/Permissions-Policy/i );
+        check_referrer( $req ) if ( $req =~ m/Referrer-Policy/i );
+    }
+}
+
+print "========================================================================\n";
+if ( $has_cpanel ) {
+    print MAGENTA "See https://support.cpanel.net/hc/en-us/articles/1500001533562 for additional information\n";
+    print YELLOW "(above is specifically for servers running cPanel)\n";
+}
+else {
+    print MAGENTA "See https://crashtest-security.com/enable-security-headers/\n";
+}
+print "\n";
+print "\nAdditional Headers\n";
+print "========================================================================\n";
+
+foreach my $add (@additional_headers) {
+    chomp($add);
+    if ( grep { /$add/i } @headers ) {
+        print "$add - " . GREEN "[GOOD]\n";
+        foreach my $head( @headers ) {
+            next unless( $head =~ m/$add/i );
+            print CYAN "\t\\_ $head\n";
+        }
+    }
+    else {
+        print "$add - " . YELLOW "[MISSING]\n";
+    }
+}
+
+print "========================================================================\n";
+print "Upcoming/Experimental Headers\n";
+print "========================================================================\n";
+
+foreach my $exp (@experimental_headers) {
+    chomp($exp);
+    if ( grep { /$exp/i } $headers ) {
+        print "$exp - " . GREEN "[GOOD]\n";
+    }
+    else {
+        print "$exp - " . YELLOW "[MISSING]\n";
+    }
+}
+
+print "========================================================================\n";
+
+
+sub check_hsts {
+    my $req = shift;
+    # Strict-Transport-Security
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header set Strict-Transport-Security \"max-age=31536000; includeSubDomains; preload\"\n" if ( $req =~ m{Strict-Transport-Security} );;
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains; preload';\"\n" if ( $req =~ m{Strict-Transport-Security}i );;
+    }
+    else {
+        print WHITE "\t\\_ HTTP Strict Transport Security is an excellent feature to support on your site and strengthens your implementation of TLS by getting the User Agent to enforce the use of HTTPS. Recommended value \"Strict-Transport-Security: max-age=31536000; includeSubDomains\".\n";
+    }
+}
+
+sub check_x_frame_options {
+    my $req = shift;
+    # X-Frame-Options
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header always append X-Frame-Options DENY\n" if ( $req =~ m{X-Frame-Options}i );
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header X-Frame-Options \"DENY\";\n" if ( $req =~ m{X-Frame-Options} );
+    }
+    else {
+        print WHITE "\t\\_ X-Frame-Options tells the browser whether you want to allow your site to be framed or not. By preventing a browser from framing your site you can defend against attacks like clickjacking. Recommended value \"X-Frame-Options: SAMEORIGIN\".\n";
+    }
+}
+
+sub check_x_content_type_options {
+    my $req = shift;
+    # X-Content-Type-Options
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header set X-Content-Type-Options nosniff\n" if ( $req =~ m{X-Content-Type-Options}i );
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header X-Content-Type-Options nosniff;\n" if ( $req =~ m{X-Content-Type-Options} );
+    }
+    else {
+        print WHITE "\t\\_ X-Content-Type-Options stops a browser from trying to MIME-sniff the content type and forces it to stick with the declared content-type. The only valid value for this header is \"X-Content-Type-Options: nosniff\".\n";
+    }
+}
+
+sub check_csp {
+    my $req = shift;
+    # Content-Security-Policy
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header set Content-Security-Policy \"default-src 'self';\"\n" if ( $req =~ m{Content-Security-Policy}i );
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header Content-Security-Policy \"default-src 'self';\";\n" if ( $req =~ m{Content-Security-Policy} );
+    }
+    else {
+        print WHITE "\t\\_ Content Security Policy is an effective measure to protect your site from XSS attacks. By whitelisting sources of approved content, you can prevent the browser from loading malicious assets.\n";
+    }
+}
+
+sub check_perms {
+    my $req = shift;
+    # Permissions Policy
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header always set Permissions-Policy \"fullscreen 'none' \"\n" if ( $req =~ m{Permissions-Policy}i );
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header Permissions-Policy \"fullscreen 'none'\";\n" if ( $req =~ m{Permissions-Policy} );
+    }
+    else {
+        print WHITE "\t\\_ Permissions Policy is a new header that allows a site to control which features and APIs can be used in the browser.\n";
+    }
+}
+
+sub check_referrer {
+    my $req = shift;
+    # Referrer-Policy
+    if ( $server =~ m/apache/i ) {
+        print WHITE "\t\\_ Add the following line to the httpd.conf file:" . YELLOW "\n\t\\_ Header set Referrer-Policy \"no-referrer\"\n" if ( $req =~ m{Referrer-Policy}i );
+    }
+    elsif ( $server =~ m/nginx/i ) {
+        print WHITE "\t\\_ Add the following to the nginx.conf file:" . YELLOW "\n\t\\_ add_header Referrer-Policy \"no-referrer\";\n" if ( $req =~ m{Referrer-Policy} );
+    }
+    else {
+        print WHITE "\t\\_ Referrer Policy is a new header that allows a site to control how much information the browser includes with navigations away from a document and should be set by all sites.\n";
+    }
+}
+
+
